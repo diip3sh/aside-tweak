@@ -1,0 +1,4 @@
+/* Example tweak. Rename to square-corners.css to enable it. */
+* {
+  border-radius: 0 !important;
+}

@@ -1,0 +1,14 @@
+{
+  "animationMode" : "default",
+  "backgroundOpacity" : 100,
+  "font" : "default",
+  "hideNewTabContent" : true,
+  "nativeHidden" : [
+    "chats",
+    "squarePage",
+    "squareEdge"
+  ],
+  "roundness" : 1.6,
+  "sidebarAnimation" : "none",
+  "textSize" : 100
+}

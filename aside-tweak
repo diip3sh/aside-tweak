@@ -1,0 +1,273 @@
+#!/usr/bin/python3
+"""Apply your CSS tweaks to Aside's UI without modifying or re-signing the app.
+
+Aside keeps its UI extension in its data folder. This adds two marked lines to that
+extension's HTML pages and two files to its assets. Nothing else is changed.
+"""
+import argparse
+import json
+import os
+import plistlib
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+SCRIPT = Path(__file__).resolve()
+TWEAKS = SCRIPT.parent / "tweaks"
+SETTINGS = TWEAKS / "settings.json"
+DATA_DIR = Path.home() / "Library/Application Support/Aside"
+# macOS blocks background jobs from reading ~/Documents, so auto-apply runs from a copy here.
+AUTO_HOME = Path.home() / "Library/Application Support/aside-tweak"
+CSS_NAME = "aside-tweak.css"
+LIVE_NAME = "aside-tweak-live.js"
+SITES_NAME = "aside-tweak-sites.css"
+SITES_SOURCE = TWEAKS / "websites.css"
+MANIFEST_BACKUP = "manifest.json.aside-tweak-orig"
+TAGS = (
+    f'<link rel="stylesheet" href="/assets/{CSS_NAME}" data-aside-tweak>\n'
+    f'  <script src="/assets/{LIVE_NAME}" data-aside-tweak></script>'
+)
+TAG_LINE = re.compile(r"[ \t]*<(?:link|script)[^>]*data-aside-tweak[^>]*>(?:</script>)?\r?\n?")
+LABEL = "local.aside-tweak.autoapply"
+AGENT = Path.home() / "Library/LaunchAgents" / f"{LABEL}.plist"
+AUTO_LOG = Path.home() / "Library/Logs/aside-tweak.log"
+DEFAULT_ROUNDNESS = 1.4
+LOCAL_STATE = "Local State"
+FLYOVER_FLAG = "side-panel-flyover-animation"
+# Positions of the options in chrome://flags. Aside stores the position, so this order matters.
+FLYOVER_CHOICES = {"default": None, "smooth": 1, "250": 2, "300": 3, "350": 4}
+FONTS = {
+    "system": '-apple-system, BlinkMacSystemFont, "Helvetica Neue", sans-serif',
+    "serif": '"New York", Georgia, serif',
+    "mono": '"SF Mono", Menlo, monospace',
+}
+# Swaps in a new stylesheet as soon as the file changes, while the page is visible.
+LIVE_JS = """(() => {
+  const link = document.querySelector('link[data-aside-tweak]');
+  if (!link) return;
+  const url = new URL(link.href).pathname;
+  let last;
+  setInterval(async () => {
+    if (document.hidden) return;
+    try {
+      const text = await (await fetch(url, { cache: 'no-store' })).text();
+      if (last !== undefined && text !== last) link.href = `${url}?${Date.now()}`;
+      last = text;
+    } catch {}
+  }, 500);
+})();
+"""
+
+
+def versions(data_dir):
+    """Every installed copy of the UI extension. The password manager is never touched."""
+    return sorted(p.parent for p in (data_dir / "AsideAgentManager").glob("*/manifest.json"))
+
+
+def write_atomic(path, text):
+    temp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    temp.write_text(text, encoding="utf-8")
+    os.chmod(temp, path.stat().st_mode & 0o777 if path.exists() else 0o600)
+    os.replace(temp, path)
+
+
+def settings_css():
+    """CSS for the controls in the app. A setting left at its default adds nothing."""
+    try:
+        settings = json.loads(SETTINGS.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+    root, rules = [], []
+    roundness = settings.get("roundness", DEFAULT_ROUNDNESS)
+    if roundness != DEFAULT_ROUNDNESS:
+        root.append(f"--squircle-factor: {float(roundness):g};")
+    font = FONTS.get(settings.get("font"))
+    if font:
+        root += [f"--font-sans: {font};", f"--font-display: {font};"]
+    opacity = settings.get("backgroundOpacity", 100)
+    if opacity != 100:
+        root.append(f"--web-content-background: color-mix(in oklab, var(--background) {float(opacity):g}%, transparent);")
+    if root:
+        rules.append(":root, :host {\n  " + "\n  ".join(root) + "\n}")
+    text_size = settings.get("textSize", 100)
+    if text_size != 100:
+        rules.append(f"html {{ font-size: {float(text_size):g}%; }}")
+    if settings.get("hideNewTabContent"):
+        rules.append("#new-tab-tasks { display: none !important; }")
+    # Near zero rather than none, because some UI waits for an animation to end.
+    duration = {"fast": ".06s", "off": ".001s"}.get(settings.get("animationMode"))
+    if duration:
+        rules.append(
+            "*, *::before, *::after {\n"
+            f"  transition-duration: {duration} !important;\n"
+            f"  animation-duration: {duration} !important;\n"
+            "  transition-delay: 0s !important;\n"
+            "  animation-delay: 0s !important;\n"
+            "}"
+        )
+    return "\n".join(rules)
+
+
+def ui_css_files():
+    return [f for f in sorted(TWEAKS.glob("*.css")) if f != SITES_SOURCE]
+
+
+def apply_websites_css(version):
+    """Adds a stylesheet for every website through the extension's manifest."""
+    manifest = version / "manifest.json"
+    backup = version / MANIFEST_BACKUP
+    target = version / "assets" / SITES_NAME
+    css = SITES_SOURCE.read_text(encoding="utf-8") if SITES_SOURCE.exists() else ""
+    if not css.strip():
+        remove_websites_css(version)
+        return
+    write_atomic(target, css)
+    if backup.exists():
+        return
+    shutil.copy2(manifest, backup)
+    data = json.loads(manifest.read_text(encoding="utf-8"))
+    data.setdefault("content_scripts", []).append({
+        "matches": ["<all_urls>"],
+        "css": [f"assets/{SITES_NAME}"],
+        "run_at": "document_start",
+        "all_frames": True,
+    })
+    write_atomic(manifest, json.dumps(data, indent=2))
+
+
+def remove_websites_css(version):
+    (version / "assets" / SITES_NAME).unlink(missing_ok=True)
+    backup = version / MANIFEST_BACKUP
+    if backup.exists():
+        os.replace(backup, version / "manifest.json")
+
+
+def stylesheet():
+    parts = [":root { --aside-tweak-active: 1; }"]
+    from_settings = settings_css()
+    if from_settings:
+        parts.append(f"/* settings */\n{from_settings}")
+    for file in ui_css_files():
+        parts.append(f"/* {file.name} */\n{file.read_text(encoding='utf-8')}")
+    return "\n\n".join(parts) + "\n"
+
+
+def sync_auto_home():
+    if SCRIPT.parent == AUTO_HOME:
+        return
+    shutil.rmtree(AUTO_HOME, ignore_errors=True)
+    AUTO_HOME.mkdir(parents=True)
+    shutil.copy2(SCRIPT, AUTO_HOME / SCRIPT.name)
+    shutil.copytree(TWEAKS, AUTO_HOME / "tweaks")
+
+
+def cmd_apply(args):
+    found = versions(args.data_dir)
+    if not found:
+        sys.exit(f"No Aside UI extension found in {args.data_dir}")
+    if AGENT.exists():
+        sync_auto_home()
+    css = stylesheet()
+    for version in found:
+        write_atomic(version / "assets" / LIVE_NAME, LIVE_JS)
+        write_atomic(version / "assets" / CSS_NAME, css)
+        apply_websites_css(version)
+        for page in version.glob("*.html"):
+            html = page.read_text(encoding="utf-8")
+            # Stripping first also upgrades pages patched by an older version of this tool.
+            patched = TAG_LINE.sub("", html).replace("</head>", f"  {TAGS}\n  </head>", 1)
+            if patched != html:
+                write_atomic(page, patched)
+    print("Applied. Pages opened before the first apply need reopening once; after that they update live.")
+
+
+def cmd_restore(args):
+    for version in versions(args.data_dir):
+        (version / "assets" / CSS_NAME).unlink(missing_ok=True)
+        (version / "assets" / LIVE_NAME).unlink(missing_ok=True)
+        remove_websites_css(version)
+        for page in version.glob("*.html"):
+            html = page.read_text(encoding="utf-8")
+            if "data-aside-tweak" in html:
+                write_atomic(page, TAG_LINE.sub("", html))
+    print("Removed all tweaks. Reopen the Aside tab or panel to see the original.")
+
+
+def cmd_status(args):
+    found = versions(args.data_dir)
+    installed = [{"version": v.name, "tweaked": (v / "assets" / CSS_NAME).exists()} for v in found]
+    if args.json:
+        print(json.dumps({"versions": installed, "autoApply": AGENT.exists()}))
+        return
+    if not found:
+        print(f"No Aside UI extension found in {args.data_dir}")
+    for item in installed:
+        print(f"{item['version']}: {'tweaked' if item['tweaked'] else 'original'}")
+    print(f"auto-apply: {'on' if AGENT.exists() else 'off'}")
+    print(f"enabled files: {', '.join(f.name for f in ui_css_files()) or 'none'}")
+
+
+def cmd_sidebar_animation(args):
+    """Aside rewrites Local State when it quits, so this has to happen while it's closed."""
+    running = subprocess.run(["/usr/bin/pgrep", "-f", "Aside.app/Contents/MacOS/Aside( |$)"], capture_output=True)
+    if args.data_dir == DATA_DIR and running.returncode == 0:
+        sys.exit("Quit Aside first.")
+    path = args.data_dir / LOCAL_STATE
+    state = json.loads(path.read_text(encoding="utf-8"))
+    browser = state.setdefault("browser", {})
+    flags = [f for f in browser.get("enabled_labs_experiments", []) if not f.startswith(f"{FLYOVER_FLAG}@")]
+    position = FLYOVER_CHOICES[args.choice]
+    if position is not None:
+        flags.append(f"{FLYOVER_FLAG}@{position}")
+    if flags:
+        browser["enabled_labs_experiments"] = flags
+    else:
+        browser.pop("enabled_labs_experiments", None)
+    write_atomic(path, json.dumps(state, ensure_ascii=False, separators=(",", ":")))
+    print(f"Sidebar animation set to {args.choice}. It takes effect the next time Aside opens.")
+
+
+def cmd_autoapply(args):
+    uid = os.getuid()
+    subprocess.run(["/bin/launchctl", "bootout", f"gui/{uid}/{LABEL}"], capture_output=True)
+    if args.state == "off":
+        AGENT.unlink(missing_ok=True)
+        shutil.rmtree(AUTO_HOME, ignore_errors=True)
+        print("Auto-apply is off.")
+        return
+    sync_auto_home()
+    AGENT.parent.mkdir(parents=True, exist_ok=True)
+    AGENT.write_bytes(plistlib.dumps({
+        "Label": LABEL,
+        "ProgramArguments": [str(AUTO_HOME / SCRIPT.name), "--data-dir", str(args.data_dir), "apply"],
+        "WatchPaths": [str(args.data_dir / "AsideAgentManager")],
+        "StandardOutPath": str(AUTO_LOG),
+        "StandardErrorPath": str(AUTO_LOG),
+    }))
+    subprocess.run(["/bin/launchctl", "bootstrap", f"gui/{uid}", str(AGENT)], check=True)
+    print("Auto-apply is on. It runs only when Aside installs a UI update.")
+
+
+def main():
+    parser = argparse.ArgumentParser(prog="aside-tweak", description=__doc__)
+    parser.add_argument("--data-dir", type=Path, default=DATA_DIR, help=argparse.SUPPRESS)
+    commands = parser.add_subparsers(dest="command", required=True)
+    commands.add_parser("apply", help="apply settings and tweaks/*.css").set_defaults(func=cmd_apply)
+    commands.add_parser("restore", help="remove all tweaks").set_defaults(func=cmd_restore)
+    status = commands.add_parser("status", help="show what is tweaked")
+    status.add_argument("--json", action="store_true")
+    status.set_defaults(func=cmd_status)
+    flag = commands.add_parser("sidebar-animation", help="set the sidebar animation while Aside is closed")
+    flag.add_argument("choice", choices=list(FLYOVER_CHOICES))
+    flag.set_defaults(func=cmd_sidebar_animation)
+    auto = commands.add_parser("autoapply", help="re-apply when Aside updates its UI")
+    auto.add_argument("state", choices=["on", "off"])
+    auto.set_defaults(func=cmd_autoapply)
+    args = parser.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
